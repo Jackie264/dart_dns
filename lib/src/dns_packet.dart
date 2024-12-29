@@ -201,6 +201,34 @@ class DnsResourceRecord extends SelfCodec {
     ttl = 600;
   }
 
+  static const int typeSvcb = 64; // SVCB record type
+  static const int typeHttps = 65; // HTTPS record type
+
+  SvcbData? svcbData; // Object to store SVCB record data
+    
+  // Define parameter type constants for better type safety
+  static const int paramSvcPriority = 1;
+  static const int paramTargetName = 2;
+  static const int paramPort = 3;
+  static const int paramIpv4Hint = 4;
+  static const int paramIpv6Hint = 5;
+
+  class SvcbData {
+    final int priority;
+    final String targetName;
+    final int? port; // 可选的端口号
+    final List<IpAddress>? ipv4hint; // IPv4 地址提示
+    final List<IpAddress>? ipv6hint; // IPv6 地址提示
+    final Map<int, List<int>> params = {}; // Other parameters, reserved for future extensions
+
+    SvcbData(this.priority, this.targetName, {this.port, this.ipv4hint, this.ipv6hint});
+
+    @override
+    String toString() {
+      return 'SVCB: Priority=$priority, TargetName=$targetName, Port=$port, IPv4 Hint=$ipv4Hint, IPv6 Hint=$ipv6Hint, Params=$params';
+    }
+  }
+    
   @override
   void encodeSelf(RawWriter writer,
       { int startIndex = 0 , Map<String, int>? pointers}) {
@@ -228,29 +256,80 @@ class DnsResourceRecord extends SelfCodec {
     // Answer data
     writer.writeBytes(data);
   }
-
+    
   @override
   void decodeSelf(RawReader reader, {int? startIndex}) {
     startIndex ??= 0;
-    // Read name
+
     nameParts = _readDnsName(reader, startIndex);
 
-    // 2-byte type
     type = reader.readUint16();
-
-    // 2-byte class
     classy = reader.readUint16();
-
-    // 4-byte time-to-live
     ttl = reader.readUint32();
 
-    // 2-byte length
     final dataLength = reader.readUint16();
-
-    // N-byte data
+    final rdStart = reader.offset;
     data = reader.readUint8ListViewOrCopy(dataLength);
+      
+    try { // Add try-catch block for error handling during SVCB/HTTPS decoding
+      switch (type) {
+        case typeSvcb:
+        case typeHttps: // HTTPS record parsing logic is similar to SVCB
+          final priority = reader.readUint16();
+          final targetName = _readDnsName(reader, startIndex);
+          final paramsLength = reader.readUint16();
+          if (paramsLength > reader.availableLengthInBytes) {
+            throw StateError('Invalid parameters length'); // Throw error if parameter length is invalid
+          }
+          final paramsReader = RawReader(reader.readBytes(paramsLength));
+          final svcbData = SvcbData(priority, targetName);
+
+          while (paramsReader.availableLengthInBytes > 0) {
+            final key = paramsReader.readUint16();
+            final valueLength = paramsReader.readUint16();
+            if (valueLength > paramsReader.availableLengthInBytes) {
+              throw StateError('Invalid parameter value length'); // Throw error if parameter length is invalid
+            }
+            final value = paramsReader.readBytes(valueLength);
+            svcbData.params[key] = value;
+            switch (key) {
+              case paramPort:
+                if (value.length == 2) {
+                  svcbData.port = ByteData.view(Uint8List.fromList(value).buffer).getUint16(0);
+                }
+                break;
+              case paramIpv4Hint:
+                if (value.length % 4 == 0) {
+                  svcbData.ipv4Hint = [];
+                  for (var i = 0; i < value.length; i += 4) {
+                    svcbData.ipv4Hint!.add(IpAddress.fromBytes(value.sublist(i, i + 4)));
+                  }
+                }
+                break;
+              case paramIpv6Hint:
+                if (value.length % 16 == 0) {
+                  svcbData.ipv6Hint = [];
+                  for (var i = 0; i < value.length; i += 16) {
+                    svcbData.ipv6Hint!.add(IpAddress.fromBytes(value.sublist(i, i + 16)));
+                  }
+                }
+                break;
+            }
+          }
+          this.svcbData = svcbData;
+          break;
+        default:
+          break;
+      }
+    } catch (e) {
+      print('Error decoding SVCB/HTTPS record: $e'); // Print error message
+      // You can choose to throw the exception or log the error here.
+    }
+    reader.offset = rdStart + dataLength; // Maintain reader offset
+
   }
 
+  @override
   String dataAsHumanReadableString() {
     switch (type) {
       case typeText:
@@ -287,7 +366,7 @@ class DnsResourceRecord extends SelfCodec {
           return ip.toString();
         }
         return 'Invalid AAAA record data';
-
+            
       case typeCanonicalName:
       case typeNameServer:
       case typeDomainNamePointer:
@@ -301,6 +380,15 @@ class DnsResourceRecord extends SelfCodec {
       default:
       // For other types, just return a hex string or raw bytes for now.
         return 'Raw data: ${data.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ')}';
+
+      case typeSvcb:
+      case typeHttps:
+        if (svcbData != null) {
+          return svcbData.toString();
+        }
+        return 'Invalid SVCB/HTTPS record data';
+      default:
+        return super.dataAsHumanReadableString();
     }
   }
 
@@ -525,8 +613,12 @@ enum DnsRecordType {
   ptr(12),
   mg(14),
   caa(257);
+  svcb(64), // Add SVCB type
+  https(65); // Add HTTPS type
+    
   final int value;
   const DnsRecordType(this.value);
+    
   factory DnsRecordType.fromInt(int value) {
     switch (value) {
       case 1:
@@ -551,6 +643,10 @@ enum DnsRecordType {
         return DnsRecordType.mg;
       case 257:
         return DnsRecordType.caa;
+      case 64: // Add SVCB case
+        return DnsRecordType.svcb;
+      case 65: // Add HTTPS case
+        return DnsRecordType.https;
       default:
         throw ArgumentError.value(value, 'value', 'Invalid DNS record type');
     }
@@ -579,7 +675,10 @@ enum DnsRecordType {
         return 'MG';
       case DnsRecordType.caa:
         return 'CAA';
-
+      case DnsRecordType.svcb: // Add SVCB label
+        return 'SVCB';
+      case DnsRecordType.https: // Add HTTPS label
+        return 'HTTPS';
       default:
         return 'type $this';
     }
@@ -603,6 +702,18 @@ class DnsQuestion extends SelfCodec {
         return 'AAAA (IPv6)';
       case DnsRecordType.any:
         return 'ANY';
+      case DnsRecordType.srv:
+        return 'SRV';
+      case DnsRecordType.ptr:
+        return 'PTR';
+      case DnsRecordType.mg:
+        return 'MG';
+      case DnsRecordType.caa:
+        return 'CAA';
+      case DnsRecordType.svcb: // Add SVCB string
+        return 'SVCB';
+      case DnsRecordType.https: // Add HTTPS string
+        return 'HTTPS';
       default:
         return 'type $type';
     }
